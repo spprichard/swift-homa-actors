@@ -59,7 +59,7 @@ final class HomaTransport: RPCTransport, @unchecked Sendable {
                 }
             } else if let call = try? JSONDecoder().decode(Call.self, from: bytes) {
                 let address = Data(peer.prefix(Int(peerLength)))
-                Task { [self] in
+                Task { [self, rpcID] in
                     let reply = await onCall?(call) ?? Reply(id: call.id, value: nil, error: "system unavailable")
                     if let response = try? JSONEncoder().encode(reply) {
                         DispatchQueue.global().async { [self] in

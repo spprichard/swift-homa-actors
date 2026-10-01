@@ -1,6 +1,6 @@
 # Proof of concept: Swift distributed actors over Homa
 
-Status: correctness-first actor runtime implemented over TCP on macOS; Linux Homa adapter added but not yet validated on a Homa host. Benchmark and inference work are deferred.  
+Status: correctness-first actor runtime implemented over TCP on macOS; Linux Homa adapter validated over loopback in an Apple `container` VM running Linux 6.17.8 with Homa built in; not yet validated on physical Linux hosts. Benchmark and inference work are deferred.  
 Prepared: 2026-09-28.
 
 ## Objective
