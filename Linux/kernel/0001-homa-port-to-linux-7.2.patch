@@ -1,0 +1,256 @@
+From 46d0e8c9e8d51a1c39e750422474b52c0cb5c6d8 Mon Sep 17 00:00:00 2001
+From: Steven Prichard <spprichard20@gmail.com>
+Date: Wed, 14 Oct 2026 16:32:54 -0500
+Subject: [PATCH] Port to Linux 7.2
+
+- __cond_acquires takes a return-value argument since 7.0 (homa_cond_acquires compat macro)
+- proto_ops bind takes struct sockaddr_unsized since 6.19
+- proto recvmsg dropped addr_len in 7.1; set msg->msg_namelen instead
+- RPS sock flow table is a tagged pointer since 7.1
+- qdisc_from_priv() removed; use container_of directly
+- Mask the RPS table index (upstream 33a467d)
+---
+ homa_impl.h     | 19 +++++++++++++++++++
+ homa_incoming.c |  2 +-
+ homa_offload.c  | 27 ++++++++++++++++++++++-----
+ homa_plumbing.c | 19 ++++++++++++++++++-
+ homa_qdisc.c    |  2 +-
+ homa_rpc.c      |  8 ++++----
+ homa_rpc.h      |  2 +-
+ 7 files changed, 66 insertions(+), 13 deletions(-)
+
+diff --git a/homa_impl.h b/homa_impl.h
+index d3cccf2..a2b9374 100644
+--- a/homa_impl.h
++++ b/homa_impl.h
+@@ -82,6 +82,15 @@ struct homa_rpc;
+ struct homa_route;
+ struct homa_sock;
+ 
++/* Linux 7.0 context analysis changed __cond_acquires to take the return
++ * value that indicates success; older kernels take only the lock.
++ */
++#ifdef __cond_acquires_impl_nonzero
++#define homa_cond_acquires(ret, x) __cond_acquires(ret, x)
++#else
++#define homa_cond_acquires(ret, x) __cond_acquires(x)
++#endif
++
+ #ifndef __STRIP__ /* See strip.py */
+ #include "timetrace.h"
+ #include "homa_metrics.h"
+@@ -643,8 +652,13 @@ extern unsigned int homa_net_id;
+ void     homa_ack_pkt(struct sk_buff *skb, struct homa_sock *hsk,
+ 		      struct homa_rpc *rpc);
+ enum skb_drop_reason homa_add_packet(struct homa_rpc *rpc, struct sk_buff *skb);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0)
+ int      homa_bind(struct socket *sk, struct sockaddr *addr,
+ 		   int addr_len);
++#else
++int      homa_bind(struct socket *sk, struct sockaddr_unsized *addr,
++		   int addr_len);
++#endif
+ void     homa_close(struct sock *sock, long timeout);
+ int      homa_copy_to_user(struct homa_rpc *rpc);
+ void     homa_data_pkt(struct sk_buff *skb, struct homa_rpc *rpc);
+@@ -672,8 +686,13 @@ int      homa_net_init(struct homa_net *hnet, struct homa *homa);
+ int      homa_net_start(struct net *net);
+ __poll_t homa_poll(struct file *file, struct socket *sock,
+ 		   struct poll_table_struct *wait);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 0)
+ int      homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ 		      int flags, int *addr_len);
++#else
++int      homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
++		      int flags);
++#endif
+ void     homa_request_retrans(struct homa_rpc *rpc);
+ int      homa_resend_data(struct homa_rpc *rpc, int start, int end);
+ void     homa_resend_pkt(struct sk_buff *skb, struct homa_rpc *rpc,
+diff --git a/homa_incoming.c b/homa_incoming.c
+index 536caa4..347c8eb 100644
+--- a/homa_incoming.c
++++ b/homa_incoming.c
+@@ -1274,7 +1274,7 @@ int homa_wait_private(struct homa_rpc *rpc, int nonblocking)
+  *            must release the lock and the reference.
+  */
+ struct homa_rpc *homa_wait_shared(struct homa_sock *hsk, int nonblocking)
+-	__cond_acquires(rpc->bucket->lock)
++	homa_cond_acquires(nonnull, rpc->bucket->lock)
+ {
+ 	struct homa_interest interest;
+ 	struct homa_rpc *rpc;
+diff --git a/homa_offload.c b/homa_offload.c
+index 46050c7..cf03659 100644
+--- a/homa_offload.c
++++ b/homa_offload.c
+@@ -76,20 +76,37 @@ int homa_offload_end(void)
+  */
+ void homa_set_softirq_cpu(struct sk_buff *skb, int cpu)
+ {
++#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 0)
+ 	struct rps_sock_flow_table *sock_flow_table;
+-	int hash;
++	u32 hash, index;
+ 
+ 	rcu_read_lock();
+ 	sock_flow_table = rcu_dereference(net_hotdata.rps_sock_flow_table);
+ 	if (sock_flow_table) {
+ 		hash = cpu + net_hotdata.rps_cpu_mask + 1;
+-		if (sock_flow_table->ents[hash] != hash) {
+-			sock_flow_table = rcu_dereference(net_hotdata.rps_sock_flow_table);
+-			sock_flow_table->ents[hash] = hash;
+-		}
++		index = hash & sock_flow_table->mask;
++		if (READ_ONCE(sock_flow_table->ents[index]) != hash)
++			WRITE_ONCE(sock_flow_table->ents[index], hash);
+ 		__skb_set_sw_hash(skb, hash, false);
+ 	}
+ 	rcu_read_unlock();
++#else
++	struct rps_sock_flow_table *table;
++	rps_tag_ptr tag_ptr;
++	u32 hash, index;
++
++	rcu_read_lock();
++	tag_ptr = READ_ONCE(net_hotdata.rps_sock_flow_table);
++	table = rps_tag_to_table(tag_ptr);
++	if (table) {
++		hash = cpu + net_hotdata.rps_cpu_mask + 1;
++		index = hash & rps_tag_to_mask(tag_ptr);
++		if (READ_ONCE(table[index].ent) != hash)
++			WRITE_ONCE(table[index].ent, hash);
++		__skb_set_sw_hash(skb, hash, false);
++	}
++	rcu_read_unlock();
++#endif
+ }
+ 
+ /**
+diff --git a/homa_plumbing.c b/homa_plumbing.c
+index 1bc1d72..cbacfc7 100644
+--- a/homa_plumbing.c
++++ b/homa_plumbing.c
+@@ -747,7 +747,11 @@ void homa_net_exit(struct net *net)
+  * Return:    0 on success, otherwise a negative errno. Sets hsk->error_msg
+  *            on errors.
+  */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 19, 0)
+ int homa_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
++#else
++int homa_bind(struct socket *sock, struct sockaddr_unsized *addr, int addr_len)
++#endif
+ {
+ 	union sockaddr_in_union *addr_in = (union sockaddr_in_union *)addr;
+ 	struct homa_sock *hsk = homa_sk(sock->sk);
+@@ -1366,12 +1370,17 @@ error_dont_end_rpc:
+  * @msg:         Controlling information for the receive.
+  * @len:         Total bytes of space available in msg->msg_iov; not used.
+  * @flags:       Flags from system call; only MSG_DONTWAIT is used.
+- * @addr_len:    Store the length of the sender address here
++ * @addr_len:    Store the length of the sender address here (before
++ *               Linux 7.1; later kernels use msg->msg_namelen)
+  * Return:       The length of the message on success, otherwise a negative
+  *               errno. Sets hsk->error_msg on errors.
+  */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 0)
+ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
+ 		 int *addr_len)
++#else
++int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags)
++#endif
+ {
+ 	struct homa_sock *hsk = homa_sk(sk);
+ 	struct homa_recvmsg_args control;
+@@ -1501,14 +1510,22 @@ int homa_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags,
+ 		in6->sin6_family = AF_INET6;
+ 		in6->sin6_port = htons(rpc->dport);
+ 		in6->sin6_addr = rpc->route->peer->addr;
++#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 0)
+ 		*addr_len = sizeof(*in6);
++#else
++		msg->msg_namelen = sizeof(*in6);
++#endif
+ 	} else {
+ 		struct sockaddr_in *in4 = msg->msg_name;
+ 
+ 		in4->sin_family = AF_INET;
+ 		in4->sin_port = htons(rpc->dport);
+ 		in4->sin_addr.s_addr = ipv6_to_ipv4(rpc->route->peer->addr);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 0)
+ 		*addr_len = sizeof(*in4);
++#else
++		msg->msg_namelen = sizeof(*in4);
++#endif
+ 	}
+ 
+ 	if (result < 0) {
+diff --git a/homa_qdisc.c b/homa_qdisc.c
+index c191df2..2f56ba0 100755
+--- a/homa_qdisc.c
++++ b/homa_qdisc.c
+@@ -861,7 +861,7 @@ int homa_qdisc_xmit_deferred_tcp(struct homa_qdisc_dev *qdev)
+ 	 * will choose a new output queue for the skb, which could result
+ 	 * in undesirable packet reordering.
+ 	 */
+-	qdisc = qdisc_from_priv(q);
++	qdisc = container_of((void *)q, struct Qdisc, privdata);
+ 	spin_lock_bh(qdisc_lock(qdisc));
+ 	qdisc_enqueue_tail(skb, qdisc);
+ 	spin_unlock_bh(qdisc_lock(qdisc));
+diff --git a/homa_rpc.c b/homa_rpc.c
+index 82e3f1f..d8aa5f0 100644
+--- a/homa_rpc.c
++++ b/homa_rpc.c
+@@ -26,7 +26,7 @@
+  */
+ struct homa_rpc *homa_rpc_alloc_client(struct homa_sock *hsk,
+ 				       const union sockaddr_in_union *dest)
+-	__cond_acquires(crpc->bucket->lock)
++	homa_cond_acquires(nonnull, crpc->bucket->lock)
+ {
+ 	struct in6_addr dest_addr_as_ipv6 = canonical_ipv6_addr(dest);
+ 	struct homa_rpc_bucket *bucket;
+@@ -112,7 +112,7 @@ error:
+ struct homa_rpc *homa_rpc_alloc_server(struct homa_sock *hsk,
+ 				       const struct in6_addr *source,
+ 				       struct homa_common_hdr *h)
+-	__cond_acquires(srpc->bucket->lock)
++	homa_cond_acquires(nonnull, srpc->bucket->lock)
+ {
+ 	u64 id = homa_local_id(h->sender_id);
+ 	struct homa_rpc_bucket *bucket;
+@@ -686,7 +686,7 @@ void homa_abort_sock_rpcs(struct homa_sock *hsk, int error)
+  *            by invoking homa_rpc_unlock.
+  */
+ struct homa_rpc *homa_rpc_find_client(struct homa_sock *hsk, u64 id)
+-	__cond_acquires(crpc->bucket->lock)
++	homa_cond_acquires(nonnull, crpc->bucket->lock)
+ {
+ 	struct homa_rpc_bucket *bucket = homa_client_rpc_bucket(hsk, id);
+ 	struct homa_rpc *crpc;
+@@ -713,7 +713,7 @@ struct homa_rpc *homa_rpc_find_client(struct homa_sock *hsk, u64 id)
+  */
+ struct homa_rpc *homa_rpc_find_server(struct homa_sock *hsk,
+ 				      const struct in6_addr *saddr, u64 id)
+-	__cond_acquires(srpc->bucket->lock)
++	homa_cond_acquires(nonnull, srpc->bucket->lock)
+ {
+ 	struct homa_rpc_bucket *bucket = homa_server_rpc_bucket(hsk, id);
+ 	struct homa_rpc *srpc;
+diff --git a/homa_rpc.h b/homa_rpc.h
+index 2f3357e..4fc127a 100644
+--- a/homa_rpc.h
++++ b/homa_rpc.h
+@@ -537,7 +537,7 @@ static inline void homa_rpc_lock(struct homa_rpc *rpc)
+  *             currently owned by someone else.
+  */
+ static inline int homa_rpc_try_lock(struct homa_rpc *rpc)
+-	__cond_acquires(rpc->bucket->lock)
++	homa_cond_acquires(nonzero, rpc->bucket->lock)
+ {
+ 	if (!spin_trylock_bh(&rpc->bucket->lock))
+ 		return 0;
+-- 
+2.55.0
+

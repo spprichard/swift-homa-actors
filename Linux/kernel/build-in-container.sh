@@ -13,6 +13,12 @@ tar -xf "$WORK/cache/linux-$KERNEL_VERSION.tar.xz" -C "$SRC" --strip-components=
 # Place HomaModule in the tree as net/homa.
 mkdir -p "$SRC/net/homa"
 git -C "$WORK/cache/HomaModule" archive "$HOMA_COMMIT" | tar -x -C "$SRC/net/homa"
+# Local patches (e.g. the Linux 7.2 port) keep both ends of a test on the
+# same Homa source; they are version-guarded and still build on 6.17.
+for p in "$WORK"/*.patch; do
+  [[ -e $p ]] || continue
+  patch -p1 -d "$SRC/net/homa" < "$p"
+done
 cp "$SRC/net/homa/homa.h" "$SRC/include/uapi/linux/homa.h"
 
 # Use the full object list from HomaModule's out-of-tree Makefile rather than

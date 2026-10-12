@@ -32,6 +32,12 @@ Linux/run.sh bash       # interactive shell on the Homa kernel, package mounted 
 
 Linux builds use `.build-linux` so they do not disturb the macOS `.build`. On the stock container kernel the Homa demo fails with `EPROTONOSUPPORT`, as intended. A VM on one Mac exercises correctness and the kernel ABI only; it says nothing about NIC-path latency.
 
+### Container client to a physical Linux host
+
+The container network is NAT-only, and macOS's NAT forwards TCP and UDP but silently drops Homa (IP protocol 146). To reach Homa on another machine, run a WireGuard tunnel between the container (start it with `--cap-add CAP_NET_ADMIN`; the kernel has `CONFIG_WIREGUARD=y`) and the host, and address the server by its tunnel IP. On the host, the firewall must allow the WireGuard UDP port and traffic arriving on the tunnel interface.
+
+`Linux/kernel/0001-homa-port-to-linux-7.2.patch` ports HomaModule `53f79638` to Linux 7.2 using version guards. It still builds on 6.17.8, and `build.sh` applies it so both ends run the same Homa source. It has been verified with a 6.17.8 container client and a 7.2.3 x86_64 server (Arch) through WireGuard.
+
 ## Linux Homa run
 
 First install and load a HomaModule revision compatible with the Linux kernel, then validate its upstream userspace utility. Check the installed `homa.h` against `Sources/CHoma/homa.c`; this adapter mirrors the UAPI fields and constants from [HomaModule `homa.h`](https://github.com/PlatformLab/HomaModule/blob/main/homa.h) as reviewed on 2026-09-28. The adapter deliberately fails at socket creation if Homa is absent. It does not fall back to TCP.
