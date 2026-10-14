@@ -3,3 +3,6 @@
 .DS_Store
 .env
 .env.*
+Linux/kernel/cache/
+Linux/kernel/out/
+.build-linux/
